@@ -1,3 +1,4 @@
+//Versão Thay
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -200,7 +201,7 @@ void setup() {
   }
   Serial.println(F("INA219 inicializado."));
 
-  // Inicializa SPI para rádio LoRa.
+  // Inicializa SPI para o rádio LoRa usado pela pilha LoRaWAN.
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
 
   // Inicializa pilha LMIC.

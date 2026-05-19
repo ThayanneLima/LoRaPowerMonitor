@@ -5,7 +5,7 @@
 // Mapeamento de pinos Heltec WiFi LoRa 32 V2
 // ============================
 
-// LoRa (SX1276/78) via SPI
+// Rádio LoRa usado pelo LoRaWAN (SX1276/78) via SPI
 static constexpr uint8_t LORA_SCK  = 5;
 static constexpr uint8_t LORA_MISO = 19;
 static constexpr uint8_t LORA_MOSI = 27;
