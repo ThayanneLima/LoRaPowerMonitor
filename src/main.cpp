@@ -1,185 +1,171 @@
-//Versão Thay
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <cstring>
 #include <Adafruit_INA219.h>
+//#include <Adafruit_BMP280.h>
 #include <lmic.h>
 #include <hal/hal.h>
+#include "PowerMode.h"
+#include "BatteryManager.h"
+#include "SystemManager.h"
 #include "pin_mapping.h"
 
-static const u1_t PROGMEM APPEUI[8] = {                 //lsb
+// ==========================================
+// Credenciais LoRaWAN OTAA
+// APPEUI e DEVEUI em little-endian; APPKEY em big-endian.
+// ==========================================
+static const u1_t PROGMEM APPEUI[8] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-static const u1_t PROGMEM DEVEUI[8] = {                 //lsb 
+static const u1_t PROGMEM DEVEUI[8] = {
     0xAA, 0x4D, 0x07, 0xD0, 0x7E, 0xD5, 0xB3, 0x70
 };
 
-static const u1_t PROGMEM APPKEY[16] = {                 //msb
-    0xFD, 0xE1, 0x58, 0x5F, 0x53, 0x5E, 0x1D, 0xDC, 
+static const u1_t PROGMEM APPKEY[16] = {
+    0xFD, 0xE1, 0x58, 0x5F, 0x53, 0x5E, 0x1D, 0xDC,
     0x79, 0x47, 0x7E, 0xA5, 0xA2, 0x02, 0xBD, 0x0C
 };
 
 // ==========================================
-// Configurações de envio
+// Configurações gerais do ciclo de envio
 // ==========================================
-static constexpr uint32_t TX_INTERVAL_MS = 60000UL;
-static constexpr uint8_t LORAWAN_FPORT = 1;
+static constexpr uint32_t TX_INTERVAL_MS = 60000UL;  // Intervalo de 1 minuto
+static constexpr uint8_t  LORAWAN_FPORT  = 1;
 
-// Objeto do sensor INA219.
-Adafruit_INA219 ina219;
+// Sensores: INA219 (bateria) e BMP280 (ambiente), ambos no I2C principal.
+Adafruit_INA219  ina219(0x40);
+//Adafruit_BMP280 bmp280;
 
-// Job do LMIC para agendamento de envio.
+// Job da pilha LMIC para agendamento assíncrono de uplinks.
 static osjob_t sendjob;
 
-// Variáveis de acumulação de energia.
-static uint32_t energia_mWh_acumulada = 0;
-static uint32_t ultimo_delta_ms = 0;
+// Instâncias concretas dos modos de energia (herança de PowerMode).
+ActiveMode      active_mode;
+ModemSleepMode  modem_sleep_mode;
+LightSleepMode  light_sleep_mode;
+DeepSleepMode   deep_sleep_mode;
+HibernationMode hibernation_mode;
+
+// Gerenciador de bateria: lê tensão via INA219 e decide o modo de energia.
+BatteryManager battery_manager(
+    ina219,
+    active_mode,
+    modem_sleep_mode,
+    light_sleep_mode,
+    deep_sleep_mode,
+    hibernation_mode);
+
+// Orquestrador do sistema: lê sensores, monta payload e gerencia energia.
+SystemManager system_manager(ina219, battery_manager);
+
+// Última medição consolidada, compartilhada entre ciclos.
+static SensorData latest_data;
 
 // ==========================================
-// Mapeamento de pinos LMIC para Heltec V2
+// Mapeamento de pinos da pilha LoRaWAN LMIC
 // ==========================================
 const lmic_pinmap lmic_pins = {
-    .nss = LORA_NSS,
+    .nss  = 18,
     .rxtx = LMIC_UNUSED_PIN,
-    .rst = LORA_RST,
-    .dio = {LORA_DIO0, LORA_DIO1, LORA_DIO2},
-    .rxtx_rx_active = 0,
-    .rssi_cal = 0,
-    .spi_freq = 8000000
+    .rst  = 14,
+    .dio  = { 26, 35, 34 },
 };
 
 // ==========================================
-// Funções de callback exigidas pela LMIC
+// Callbacks obrigatórios de credenciais OTAA
 // ==========================================
 void os_getArtEui(u1_t *buf) { memcpy_P(buf, APPEUI, 8); }
 void os_getDevEui(u1_t *buf) { memcpy_P(buf, DEVEUI, 8); }
 void os_getDevKey(u1_t *buf) { memcpy_P(buf, APPKEY, 16); }
 
 // ==========================================
-// Lê INA219 e calcula energia acumulada
+// Ciclo principal: lê sensores e envia payload
+// de 15 bytes via LoRaWAN
 // ==========================================
-static void lerSensorEAtualizarEnergia(
-    uint16_t &tensao_mV,
-    int16_t &corrente_x10mA,
-    uint16_t &potencia_mW,
-    uint32_t &energia_mWh) {
+static void executarCiclo(osjob_t *job) {
+  (void)job;
 
-  // Leitura da tensão no barramento em mV.
-  float busVoltage_V = ina219.getBusVoltage_V();
-  tensao_mV = (uint16_t)roundf(busVoltage_V * 1000.0f);
-
-  // Leitura da corrente em mA.
-  float current_mA = ina219.getCurrent_mA();
-  corrente_x10mA = (int16_t)roundf(current_mA * 10.0f);
-
-  // Potência instantânea em mW.
-  float power_mW_float = ina219.getPower_mW();
-  if (power_mW_float < 0) {
-    power_mW_float = 0;
-  }
-  potencia_mW = (uint16_t)roundf(power_mW_float);
-
-  // Integração simples da energia em mWh.
-  uint32_t agora_ms = millis();
-  uint32_t delta_ms = (ultimo_delta_ms == 0) ? 0 : (agora_ms - ultimo_delta_ms);
-  ultimo_delta_ms = agora_ms;
-
-  float delta_h = (float)delta_ms / 3600000.0f;
-  float incremento_mWh = power_mW_float * delta_h;
-  energia_mWh_acumulada += (uint32_t)roundf(incremento_mWh);
-  energia_mWh = energia_mWh_acumulada;
-}
-
-// ==========================================
-// Monta payload compacto e agenda envio LoRaWAN
-// Payload:
-// [0..1] tensão mV (uint16)
-// [2..3] corrente mA*10 (int16)
-// [4..5] potência mW (uint16)
-// [6..9] energia mWh (uint32)
-// ==========================================
-static void enviarPayload(osjob_t *j) {
-  (void)j;
-
-  // Aguarda a conclusão do join OTAA antes do envio.
+  // Aguarda o join OTAA antes do primeiro envio.
   if ((LMIC.devaddr == 0) || (LMIC.opmode & OP_JOINING)) {
-    Serial.println(F("Aguardando join OTAA antes do envio..."));
-    os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), enviarPayload);
+    Serial.println(F("Aguardando join LoRaWAN OTAA antes do envio..."));
+    os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), executarCiclo);
     return;
   }
 
-  // Se já existe transmissão em andamento, apenas reagenda.
+  // Aguarda fim de TX/RX pendente antes de encaminhar novo uplink.
   if (LMIC.opmode & OP_TXRXPEND) {
-    Serial.println(F("LMIC ocupado (TX/RX pendente), reagendando..."));
-    os_setTimedCallback(&sendjob, os_getTime() + ms2osticks(TX_INTERVAL_MS), enviarPayload);
+    Serial.println(F("LoRaWAN ocupado com TX/RX pendente, reagendando..."));
+    os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), executarCiclo);
     return;
   }
 
-  uint16_t tensao_mV = 0;
-  int16_t corrente_x10mA = 0;
-  uint16_t potencia_mW = 0;
-  uint32_t energia_mWh = 0;
+  // Lê INA219, BMP280 e bateria via SystemManager.
+  system_manager.read_sensors(latest_data);
 
-  lerSensorEAtualizarEnergia(tensao_mV, corrente_x10mA, potencia_mW, energia_mWh);
+  // Seleciona o modo de energia antes de enviar, para incluir no payload.
+  system_manager.update_mode(latest_data);
 
-  uint8_t payload[10];
-  payload[0] = (uint8_t)(tensao_mV >> 8);
-  payload[1] = (uint8_t)(tensao_mV & 0xFF);
-  payload[2] = (uint8_t)((uint16_t)corrente_x10mA >> 8);
-  payload[3] = (uint8_t)((uint16_t)corrente_x10mA & 0xFF);
-  payload[4] = (uint8_t)(potencia_mW >> 8);
-  payload[5] = (uint8_t)(potencia_mW & 0xFF);
-  payload[6] = (uint8_t)(energia_mWh >> 24);
-  payload[7] = (uint8_t)((energia_mWh >> 16) & 0xFF);
-  payload[8] = (uint8_t)((energia_mWh >> 8) & 0xFF);
-  payload[9] = (uint8_t)(energia_mWh & 0xFF);
+  // Envia payload compacto de 15 bytes via LoRaWAN.
+  system_manager.send_data(latest_data, LORAWAN_FPORT);
 
-  LMIC_setTxData2(LORAWAN_FPORT, payload, sizeof(payload), 0);
+  // Log de diagnóstico no monitor serial.
+  //Serial.print(F("Temp(C*100): "));    Serial.print(latest_data.temperatura_c100);
+ // Serial.print(F(" Pres(hPa*10): "));  Serial.print(latest_data.pressao_hPa10);
+  Serial.print(F(" V(mV): "));         Serial.print(latest_data.tensao_mV);
+  Serial.print(F(" I(mA): "));         Serial.print((float)latest_data.corrente_x10mA / 10.0f, 3);
+  Serial.print(F(" P(mW): "));         Serial.print(latest_data.potencia_mW);
+  Serial.print(F(" E(mWh): "));        Serial.print(latest_data.energia_mWh);
+  Serial.print(F(" Bat(V): "));        Serial.print((float)latest_data.tensao_mV / 1000.0f, 2);
+  Serial.print(F(" Modo: "));          Serial.println(latest_data.modo_energia);
 
-  Serial.print(F("Enviando -> V(mV): "));
-  Serial.print(tensao_mV);
-  Serial.print(F(" I(mA*10): "));
-  Serial.print(corrente_x10mA);
-  Serial.print(F(" P(mW): "));
-  Serial.print(potencia_mW);
-  Serial.print(F(" E(mWh): "));
-  Serial.println(energia_mWh);
-
-  // Delay curto para estabilidade entre envios/agendamentos.
+  // Pequena pausa para estabilidade após enfileirar uplink.
   delay(50);
 }
 
 // ==========================================
-// Callback de eventos LMIC
+// Tratamento de eventos da pilha LoRaWAN LMIC
 // ==========================================
 void onEvent(ev_t ev) {
   switch (ev) {
     case EV_JOINING:
-      Serial.println(F("Realizando join OTAA..."));
+      Serial.println(F("Realizando join LoRaWAN OTAA..."));
       break;
 
     case EV_JOINED:
-      Serial.println(F("Join OTAA concluido com sucesso."));
+      Serial.println(F("Join LoRaWAN OTAA concluido com sucesso."));
       LMIC_setLinkCheckMode(0);
-      os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(1), enviarPayload);
+      // Inicia o primeiro ciclo 1 segundo após o join.
+      os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(1), executarCiclo);
       break;
 
     case EV_JOIN_FAILED:
-      Serial.println(F("Falha no join OTAA. Nova tentativa em 30 segundos."));
+      Serial.println(F("Falha no join LoRaWAN OTAA. Reiniciando tentativa."));
       LMIC_reset();
       LMIC_startJoining();
       break;
 
-    case EV_TXCOMPLETE:
-      Serial.println(F("TX concluido."));
+    case EV_TXCOMPLETE: {
+      Serial.println(F("Transmissao LoRaWAN concluida."));
       if (LMIC.dataLen) {
         Serial.print(F("Downlink recebido, bytes: "));
         Serial.println(LMIC.dataLen);
       }
-      os_setTimedCallback(&sendjob, os_getTime() + ms2osticks(TX_INTERVAL_MS), enviarPayload);
+
+      // Seleciona o modo de energia com base na bateria e atualiza latest_data.modo_energia.
+      PowerMode& current_mode = system_manager.update_mode(latest_data);
+      Serial.print(F("Modo de energia selecionado: "));
+      Serial.println(current_mode.name());
+
+      // Entra no modo de energia pelo tempo de 1 minuto (em microssegundos).
+      current_mode.enter_mode((uint64_t)TX_INTERVAL_MS * 1000ULL);
+
+      // Ao acordar (Light/Deep/Hibernation) ou após o delay (Active/Modem),
+      // agenda o próximo ciclo de medição e envio.
+      os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(1), executarCiclo);
       break;
+    }
 
     default:
       break;
@@ -189,44 +175,46 @@ void onEvent(ev_t ev) {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println(F("Inicializando Heltec V2 + INA219 + LoRaWAN OTAA..."));
+  Serial.println(F("Inicializando Heltec V2 + INA219 + BMP280 + LoRaWAN OTAA + gerenciamento de energia..."));
 
-  // Inicializa I2C do INA219.
-  Wire.begin(I2C_SDA, I2C_SCL);
+  // Inicializa o barramento I2C compartilhado por INA219 e BMP280.
+  Wire.begin(OLED_SDA, OLED_SCL);
+  //Wire.begin(I2C_SDA, I2C_SCL);
+
+  // Inicializa o INA219 (medição de bateria).
   if (!ina219.begin()) {
-    Serial.println(F("Falha ao encontrar INA219. Verifique conexoes I2C."));
-    while (true) {
-      delay(1000);
-    }
+    Serial.println(F("ERRO: INA219 nao encontrado. Verifique conexoes I2C."));
+    while (true) { delay(1000); }
   }
+  ina219.setCalibration_16V_400mA();
   Serial.println(F("INA219 inicializado."));
 
-  // Inicializa SPI para o rádio LoRa usado pela pilha LoRaWAN.
+  // Inicializa o BMP280 (temperatura e pressao atmosferica).
+  /*if (!system_manager.init_bmp280()) {
+    Serial.println(F("ERRO: BMP280 nao encontrado. Verifique conexoes I2C (endereco 0x76)."));
+    while (true) { delay(1000); }
+  }
+  Serial.println(F("BMP280 inicializado.")); */ 
+
+  // Inicializa SPI do rádio LoRa usado pela pilha LoRaWAN.
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
 
-  // Inicializa pilha LMIC.
+  // Inicializa o framework de gerenciamento de energia.
+  system_manager.init();
+
+  // Inicializa a pilha LoRaWAN LMIC e configura parâmetros de link.
   os_init();
   LMIC_reset();
-
-  // Define canais EU868 por padrão (TTN V3).
-  // Ajuste esta parte para sua região (US915, AU915, AS923, etc).
-  LMIC_disableChannel(3);
-  LMIC_disableChannel(4);
-  LMIC_disableChannel(5);
-  LMIC_disableChannel(6);
-  LMIC_disableChannel(7);
-  LMIC_disableChannel(8);
-
-  // Parâmetros de link.
+  LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
   LMIC_setLinkCheckMode(0);
-  LMIC.dn2Dr = DR_SF9;
-  LMIC_setDrTxpow(DR_SF7, 14);
+  LMIC.dn2Dr = DR_SF12CR;
+  LMIC_setDrTxpow(DR_SF10, 14);
 
-  // Inicia o processo de join OTAA.
+  // Inicia o processo de join OTAA com a rede LoRaWAN.
   LMIC_startJoining();
 }
 
 void loop() {
-  // Loop de execução da pilha LMIC.
+  // Mantém a pilha LoRaWAN processando eventos de forma cooperativa.
   os_runloop_once();
 }
